@@ -34,6 +34,7 @@ gcc -o single_reactor single_reactor.c thread_pool.c -lpthread
 7.  当 `clientfd` 的 TCP 发送缓冲区可用时，触发 `EPOLLOUT`。Reactor 调用 `send_callback`，将 `w_buffer` 中的数据发送出去，然后重新关注 `EPOLLIN` (读) 事件。
 
 ### 流程图：
+[!single_reactor](./docs/images/single_reactor.png)
 
 ***
 
@@ -72,6 +73,7 @@ gcc -o multi_reactor multi_reactor.c thread_pool.c -lpthread
 12. 当 `fd` 可写时，Sub-Reactor 的 `epoll_wait` 触发 `EPOLLOUT`，调用 `send_callback` 发送数据，然后重新关注 `EPOLLIN`。
 
 ### 流程图：
+[!single_reactor](./docs/images/multi_reactor.png)
 
 ***
 
