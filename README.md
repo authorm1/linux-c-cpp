@@ -19,13 +19,24 @@ make
 
 **测试案例：**
 
+```c
+cd testcase/
+gcc -o testcase testcase.c
+./testcase 127.0.0.1 8888
+
+```
+
 
 **分层模型图示：**
+
 ![kvstore](docs/images/kvstore.jpg)
 
 **TCP 分包/粘包解决思路图示:**
-# reactor
+
+**reactor:**
+
 ![reactor](docs/images/reactor_tcp_pkt_split_paste.jpg)
 
-# iouring
+**iouring:**
+
 ![iouring](docs/images/proactor_tcp_pkt_split_paste.jpg)
