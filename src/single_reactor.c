@@ -4,6 +4,11 @@
 * worker线程 -> 只负责业务逻辑处理
 */
 
+/*
+* 1. 解决了上版程序中并发量比较大时，如果业务处理的很快(例如echo)，发送缓冲区堆积导致send返回值<0直接close的问题
+    -> 解决方法：send_callback支持分段发送，发送缓冲区满时保持EPOLLOUT事件，下次可写时继续发送剩余数据
+*/
+
 #include<sys/socket.h>
 #include<netinet/in.h>
 #include<arpa/inet.h>
@@ -15,29 +20,32 @@
 #include<stdlib.h>
 #include<string.h>
 #include<pthread.h>
+#include<errno.h>
+#include<time.h>
 
 #include"thread_pool.h"
 
 #define BUFFER_SIZE                     1024
 #define CONN_LIST_SIZE                  1024 * 128
 #define EPOLL_EVENT_SIZE                1024
-#define WORKER_THREAD_NUM               64
-#define TASK_QUEUE_SIZE                 1024
+#define WORKER_THREAD_NUM               8
+#define TASK_QUEUE_SIZE                 1024 * 64
 #define MAX_RESPONSE_SIZE               1024     
 
-#define ENABLE_SERVICE_SIMULATION       1 // 模拟业务处理逻辑 -> 10ms
-
-/*
-* QPS 极限 = (1000ms / 10ms) * 64 = 6400
-* 实测 QPS =  4162
-*/
+#define ENABLE_SERVICE_SIMULATION       0 // 模拟业务处理逻辑 -> 0-10ms
 
 typedef int(*RCALLBACK)(int);
 
+#define XIUGAI 1
+
 typedef struct {
     int fd;
+#if XIUGAI
+
+#else
     char* w_buffer; 
     long w_length;
+#endif
 } result_t;
 
 typedef struct {
@@ -64,9 +72,10 @@ struct conn{
     RCALLBACK send_cb;
 /*
 * 防止还有线程正在用这个 fd 时，其他线程因为某些原因将 fd close 了.
-* 比如 I/O 线程收到了断连请求，将 fd close了，，但任务队列中还有此 fd 的任务，内核将此 fd 回收，并对后面的新连接分配此 fd，
+* 比如 I/O 线程收到了断连请求，将 fd closeed，，但任务队列中还有此 fd 的任务，内核将此 fd 回收，并对后面的新连接分配此 fd，
 * worker 线程取走旧 fd 的任务并完成，然后 I/O 线程对旧 fd 执行 send 任务，但此时数据发到新 fd 那里去了。
 */
+    int send_offset; // 发送偏移，用于分段发送
     int ref_count;
     pthread_mutex_t lock;
 };
@@ -123,8 +132,12 @@ void result_queue_init() {
     g_result_queue.capacity = TASK_QUEUE_SIZE;
     pthread_mutex_init(&g_result_queue.lock, NULL);
 }
+#if XIUGAI
+void submit_result_to_io_thread(int fd){
+#else
+void submit_result_to_io_thread(int fd, char* resp_buf, int len){
 
-void submit_result_to_io_thread(int fd, char* resp_buf, int len) {
+#endif
     pthread_mutex_lock(&g_result_queue.lock);
 
     if (g_result_queue.count == g_result_queue.capacity) {
@@ -150,8 +163,12 @@ void submit_result_to_io_thread(int fd, char* resp_buf, int len) {
     
     int tail = g_result_queue.tail;
     g_result_queue.results[tail].fd = fd;
+#if XIUGAI
+
+#else
     g_result_queue.results[tail].w_buffer = resp_buf;
     g_result_queue.results[tail].w_length = len;
+#endif
     g_result_queue.tail = (tail + 1) % g_result_queue.capacity; // ring
     g_result_queue.count++;
 
@@ -164,8 +181,39 @@ void submit_result_to_io_thread(int fd, char* resp_buf, int len) {
 
 void handle_pending_results() {
     pthread_mutex_lock(&g_result_queue.lock);
-
     int count = g_result_queue.count;
+#if XIUGAI
+    // 快照
+    result_t* results_snapshot = malloc(sizeof(result_t) * count);
+    if(results_snapshot == NULL){
+        printf("malloc results_snapshot failed.\n");
+        exit(1);
+    }
+    for(int i = 0; i < count; ++i){
+        int head_pos = (g_result_queue.head + i) % g_result_queue.capacity;
+        results_snapshot[i] = g_result_queue.results[head_pos];
+    }
+    g_result_queue.head = (g_result_queue.head + count) % g_result_queue.capacity;
+    g_result_queue.count -= count;
+
+    pthread_mutex_unlock(&g_result_queue.lock);
+    
+    for(int i = 0; i < count; ++i){
+        int fd = results_snapshot[i].fd;
+        struct conn* conn_state = &conn_list[fd];
+
+        pthread_mutex_lock(&conn_state->lock);
+        if (conn_state->ref_count == 0) { 
+            pthread_mutex_unlock(&conn_state->lock);
+            continue;
+        }
+
+        pthread_mutex_unlock(&conn_state->lock);
+        set_event(fd, EPOLLOUT, 0); 
+    }
+    free(results_snapshot);
+
+#else
     result_t* results_to_send = malloc(sizeof(result_t) * count);
     if(results_to_send == NULL){
         printf("malloc results_to_send failed.\n");
@@ -204,7 +252,7 @@ void handle_pending_results() {
     }
 
     free(results_to_send);
-
+#endif
 }
 
 
@@ -219,16 +267,15 @@ int protocol_handle(char* request, int req_len, char* response){
     // echo
 #if ENABLE_SERVICE_SIMULATION
     // 模拟业务处理操作，比如查询数据库
-    #include<time.h>
 
+    long random_ns = rand() % 10000000;  // 10,000,000 ns = 10 ms
     struct timespec sleep_time = {0};
     sleep_time.tv_sec = 0;
-    sleep_time.tv_nsec = 10 * 1000 * 1000; // 10ms
+    sleep_time.tv_nsec = random_ns;
 
     nanosleep(&sleep_time, NULL);
 
-    for(int i = 0; i < 1000; ++i);
-    
+ 
 #endif
     memcpy(response, request, req_len);
     return req_len;
@@ -243,6 +290,25 @@ void task_callback(void* arg){
     }
 
     task_data_t* task_data = task->user_date;
+# if XIUGAI
+    int fd = task_data->fd;;
+    struct conn* conn_state = &conn_list[fd];
+    pthread_mutex_lock(&conn_state->lock);
+
+    char* response = malloc(MAX_RESPONSE_SIZE);
+    if(response == NULL){
+        printf("malloc response failed.\n");
+        exit(1);
+    }
+
+    int len = protocol_handle(task_data->request, task_data->len, response);
+    conn_state->w_buffer = response;
+    conn_state->w_length = len;
+
+    pthread_mutex_unlock(&conn_state->lock);
+    submit_result_to_io_thread(task_data->fd);
+
+#else
     char* response = malloc(MAX_RESPONSE_SIZE);
     if(response == NULL){
         printf("malloc response failed.\n");
@@ -250,7 +316,7 @@ void task_callback(void* arg){
     }
     int res_len = protocol_handle(task_data->request, task_data->len, response); 
     submit_result_to_io_thread(task_data->fd, response, res_len);
-
+#endif
     task_data_t* data = (task_data_t*)task->user_date;
     conn_dec_ref(&conn_list[data->fd]); // 此 worker 线程执行完这个任务，就减少对应 fd 的引用计数
     free(data->request);
@@ -330,7 +396,7 @@ int clientfd_event_register(int clientfd){
 
 int accept_callback(int listenfd){
     struct sockaddr_in client_addr = {0};
-    socklen_t len = 0;
+    socklen_t len = sizeof(client_addr);
     int clientfd = accept(listenfd, (struct sockaddr*)&client_addr, &len);
     if(clientfd == -1){
         perror("accept");
@@ -385,31 +451,52 @@ int recv_callback(int clientfd){
     return 0;
 }
 
+// 支持分段发送
 int send_callback(int clientfd){
     struct conn* conn_state = &conn_list[clientfd];
     if (conn_state->w_buffer == NULL || conn_state->w_length == 0) {
+        // 发送完成，重置偏移，转为监听读事件
+        conn_state->send_offset = 0;
         set_event(clientfd, EPOLLIN, 0);
         return 0;
     }
- 
-    int send_len = send(clientfd, conn_list[clientfd].w_buffer, conn_list[clientfd].w_length, 0);
-    if(send_len < 0){
-        perror("send");
-        if(conn_state->w_buffer != NULL){
+
+    // 尝试发送剩余数据
+    size_t to_send = conn_state->w_length - conn_state->send_offset;
+    int send_len = send(clientfd, conn_state->w_buffer + conn_state->send_offset, to_send, 0);
+    if (send_len > 0) {
+        conn_state->send_offset += send_len;
+        if (conn_state->send_offset >= conn_state->w_length) {
             free(conn_state->w_buffer);
+            conn_state->w_buffer = NULL;
+            conn_state->w_length = 0;
+            conn_state->send_offset = 0;
+            set_event(clientfd, EPOLLIN, 0);
+            return 0;
+        }
+        // 部分发送，继续尝试，下次epoll触发
+        return 0;
+    } 
+    else if (send_len < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // 发送缓冲区满，保持EPOLLOUT，下次可写时重试
+            return 0;
         } 
+        else {
+            // 如果不是发送缓冲区满导致的错误，就关闭这个连接
+            perror("send");
+            free(conn_state->w_buffer);
+            conn_state->w_buffer = NULL;
+            conn_dec_ref(conn_state);
+            return -1;
+        }
+    } 
+    else {
+        free(conn_state->w_buffer);
         conn_state->w_buffer = NULL;
-        conn_dec_ref(conn_state); 
+        conn_dec_ref(conn_state);
         return -1;
     }
-
-    free(conn_state->w_buffer);
-    conn_state->w_buffer = NULL;
-    conn_state->w_length = 0;
-
-    set_event(clientfd, EPOLLIN, 0); // 写完关注可读事件
-
-    return 0;
 }
 
 int main(int argc, char** argv){
@@ -461,16 +548,26 @@ int main(int argc, char** argv){
     }
 
 end:
+#if XIUGAI
+    nThreadPoolDestroy(&g_pool);
+
     for(int fd = 0; fd < CONN_LIST_SIZE; ++fd){
         struct conn* conn_state = &conn_list[fd];
         if(conn_state->w_buffer != NULL){
             free(conn_state->w_buffer);
-        }    
+        }
+        if(conn_state->ref_count > 0){ // 说明此 fd 还没被关闭
+            close(conn_state->fd);
+            pthread_mutex_destroy(&conn_state->lock);
+        }
     }
     if(g_result_queue.results != NULL){
         free(g_result_queue.results);
     }
-    nThreadPoolDestroy(&g_pool);
 
+    close(g_eventfd);
+    close(epollfd);
+    close(listenfd);
+#endif
     return 0;
 }

@@ -30,7 +30,7 @@ gcc -o single_reactor single_reactor.c thread_pool.c -lpthread
 3.  工作线程从任务队列中取出任务，执行 `task_callback`，调用 `protocol_handle` (模拟耗时 10ms 的业务)。
 4.  业务处理完毕后，将响应数据打包为 `result_t` 推入结果队列 `result_queue` 中（使用互斥锁保证线程安全），随后利用 `eventfd` 通知 I/O 线程。
 5.  I/O 线程的 `epoll_wait` 被 `eventfd` 唤醒。
-6.  I/O 线程调用 `handle_pending_results`，从 `result_queue` 中取出所有响应，并将结果数据挂载到 `clientfd` 绑定的 `w_buffer` 上，然后修改 `epoll`，关注该 `clientfd` 的 `EPOLLOUT` (写) 事件。
+6.  I/O 线程调用 `handle_pending_results`，从 `result_queue` 中取出所有响应，然后修改 `epoll`，关注该 `clientfd` 的 `EPOLLOUT` (写) 事件。
 7.  当 `clientfd` 的 TCP 发送缓冲区可用时，触发 `EPOLLOUT`。Reactor 调用 `send_callback`，将 `w_buffer` 中的数据发送出去，然后重新关注 `EPOLLIN` (读) 事件。
 
 ### 流程图：
@@ -69,7 +69,7 @@ gcc -o multi_reactor multi_reactor.c thread_pool.c -lpthread
 8.  Worker 线程从任务队列中取出任务，执行 `task_callback` (处理 10ms 业务)。
 9.  Worker 处理完毕后，将 `result_t` (响应数据) 推入**来源 Sub-Reactor** 的 `result_queue` 中。
 10. Worker 通过该 Sub-Reactor 专属的 `resqueue_eventfd` 唤醒它。
-11. Sub-Reactor 被 `resqueue_eventfd` 唤醒，调用 `handle_pending_results` 取出结果，挂载到 `w_buffer`，并注册 `EPOLLOUT`。
+11. Sub-Reactor 被 `resqueue_eventfd` 唤醒，调用 `handle_pending_results` 取出结果，并注册 `EPOLLOUT`。
 12. 当 `fd` 可写时，Sub-Reactor 的 `epoll_wait` 触发 `EPOLLOUT`，调用 `send_callback` 发送数据，然后重新关注 `EPOLLIN`。
 
 ### 流程图：

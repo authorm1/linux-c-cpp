@@ -18,30 +18,33 @@
 #include <stdlib.h>
 #include <string.h>
 #include <pthread.h>
+#include<errno.h>
+#include<time.h>
 
 #include "thread_pool.h"
 
 #define BUFFER_SIZE                   1024
 #define CONN_LIST_SIZE                1024 * 128
 #define EPOLL_EVENT_SIZE              1024
-#define WORKER_THREAD_NUM             64
-#define SUBREACTOR_THREAD_NUM         8
+#define WORKER_THREAD_NUM             8
+#define SUBREACTOR_THREAD_NUM         1
 #define TASK_QUEUE_SIZE               1024
 #define FD_QUEUE_SIZE                 1024
 #define MAX_RESPONSE_SIZE             1024    
 
 #define ENABLE_SERVICE_SIMULATION     1 // 模拟业务处理逻辑
 
-/*
- * QPS 极限 = (1000ms / 10ms) * 64 = 6400
- * 实测 QPS =  4172
- */
+#define XIUGAI 1
 
 typedef struct
 {
     int fd;
+#if XIUGAI
+
+#else
     char *w_buffer;
     long w_length;
+#endif
 } result_t;
 
 typedef struct
@@ -74,6 +77,7 @@ struct conn
      * 比如 I/O 线程收到了断连请求，将 fd close了，，但任务队列中还有此 fd 的任务，内核将此 fd 回收，并对后面的新连接分配此 fd，
      * worker 线程取走旧 fd 的任务并完成，然后 I/O 线程对旧 fd 执行 send 任务，但此时数据发到新 fd 那里去了。
      */
+    int send_offset; // 发送偏移，用于分段发送
     int ref_count;
     pthread_mutex_t lock;
 };
@@ -115,6 +119,8 @@ typedef struct
 } subreactor_data_t;
 
 subreactor_data_t subreactor_data_list[SUBREACTOR_THREAD_NUM] = {0};
+
+int g_subreactor_running = 1;
 
 int recv_callback(int fd, subreactor_state_t *state);
 int send_callback(int fd, subreactor_state_t *state);
@@ -164,8 +170,11 @@ void result_queue_init(result_queue_t *result_queue)
     result_queue->capacity = TASK_QUEUE_SIZE;
     pthread_mutex_init(&result_queue->lock, NULL);
 }
-
+#if XIUGAI
+void submit_result_to_io_thread(int fd, subreactor_state_t *state)
+#else
 void submit_result_to_io_thread(int fd, char *resp_buf, int len, subreactor_state_t *state)
+#endif
 {
     pthread_mutex_lock(&state->result_queue.lock);
 
@@ -194,8 +203,12 @@ void submit_result_to_io_thread(int fd, char *resp_buf, int len, subreactor_stat
 
     int tail = state->result_queue.tail;
     state->result_queue.results[tail].fd = fd;
+#if XIUGAI
+
+#else
     state->result_queue.results[tail].w_buffer = resp_buf;
     state->result_queue.results[tail].w_length = len;
+#endif
     state->result_queue.tail = (tail + 1) % state->result_queue.capacity; // ring
     state->result_queue.count++;
 
@@ -214,12 +227,12 @@ void submit_clientfd_to_subreactor(int clientfd, int index)
     if (subreactor->fd_queue.count == subreactor->fd_queue.capacity)
     {
         int new_capacity = subreactor->fd_queue.capacity * 2;
-        printf("Result queue is full. Reallocating from %d to %d\n", subreactor->fd_queue.capacity, new_capacity);
+        // printf("Result queue is full. Reallocating from %d to %d\n", subreactor->fd_queue.capacity, new_capacity);
 
         int *new_fds = (int *)malloc(new_capacity * sizeof(int));
         if (new_fds == NULL)
         {
-            printf("malloc for new result queue failed.\n");
+            // printf("malloc for new result queue failed.\n");
             exit(1);
         }
 
@@ -287,6 +300,35 @@ void handle_pending_results(subreactor_state_t *state)
     pthread_mutex_lock(&state->result_queue.lock);
 
     int count = state->result_queue.count;
+#if XIUGAI
+    result_t* results_snapshot = malloc(sizeof(result_t) * count);
+    if(results_snapshot == NULL){
+        printf("malloc results_snapshot failed.\n");
+        exit(1);
+    }
+    for(int i = 0; i < count; ++i){
+        int head_pos = (state->result_queue.head + i) % state->result_queue.capacity;
+        results_snapshot[i] = state->result_queue.results[head_pos];
+    }
+    state->result_queue.head = (state->result_queue.head + count) % state->result_queue.capacity;
+    state->result_queue.count -= count;
+
+    pthread_mutex_unlock(&state->result_queue.lock);
+    for(int i = 0; i < count; ++i){
+        int fd = results_snapshot[i].fd;
+        struct conn* conn_state = &g_conn_list[fd];
+
+        pthread_mutex_lock(&conn_state->lock);
+        if (conn_state->ref_count == 0) { 
+            pthread_mutex_unlock(&conn_state->lock);
+            continue;
+        }
+
+        pthread_mutex_unlock(&conn_state->lock);
+        set_event(fd, EPOLLOUT, 0, state);
+    }
+    free(results_snapshot);
+#else
     result_t *results_to_send = malloc(sizeof(result_t) * count);
     if (results_to_send == NULL)
     {
@@ -310,15 +352,13 @@ void handle_pending_results(subreactor_state_t *state)
 
         // 需要判断这个 fd 是否已经被 close 了
         pthread_mutex_lock(&conn_state->lock);
-        if (conn_state->ref_count == 0)
-        {
+        if (conn_state->ref_count == 0){
             pthread_mutex_unlock(&conn_state->lock);
             free(results_to_send[i].w_buffer);
             continue;
         }
 
-        if (conn_state->w_buffer)
-        {
+        if (conn_state->w_buffer){
             free(conn_state->w_buffer);
         }
         conn_state->w_buffer = results_to_send[i].w_buffer;
@@ -330,6 +370,7 @@ void handle_pending_results(subreactor_state_t *state)
     }
 
     free(results_to_send);
+#endif
 }
 
 typedef struct
@@ -345,15 +386,12 @@ int protocol_handle(char *request, int req_len, char *response)
     // echo
 #if ENABLE_SERVICE_SIMULATION
     // 模拟业务处理操作，比如查询数据库
-    #include<time.h>
-
+    long random_ns = rand() % 10000000;  // 10,000,000 ns = 10 ms
     struct timespec sleep_time = {0};
     sleep_time.tv_sec = 0;
-    sleep_time.tv_nsec = 10 * 1000 * 1000; // 10ms
+    sleep_time.tv_nsec = random_ns;
 
     nanosleep(&sleep_time, NULL);
-
-    for (int i = 0; i < 1000; ++i);
 #endif
     memcpy(response, request, req_len);
     return req_len;
@@ -362,22 +400,42 @@ int protocol_handle(char *request, int req_len, char *response)
 // fd recv_buf recv_len
 void task_callback(void *arg)
 {
-    struct nTask *task = (struct nTask *)arg;
-    if (task == NULL)
-    {
+
+    struct nTask* task = (struct nTask*)arg;
+    if(task == NULL){
         printf("task_callback arg == NULL.\n");
         exit(1);
     }
 
-    task_data_t *task_data = task->user_date;
-    char *response = malloc(MAX_RESPONSE_SIZE);
-    if (response == NULL)
-    {
+    task_data_t* task_data = task->user_date;
+
+# if XIUGAI
+    int fd = task_data->fd;;
+    struct conn* conn_state = &g_conn_list[fd];
+    pthread_mutex_lock(&conn_state->lock);
+
+    char* response = malloc(MAX_RESPONSE_SIZE);
+    if(response == NULL){
         printf("malloc response failed.\n");
         exit(1);
     }
-    int res_len = protocol_handle(task_data->request, task_data->len, response);
-    submit_result_to_io_thread(task_data->fd, response, res_len, task_data->state); // 需要传入 &result_queue res_eventfd
+
+    int len = protocol_handle(task_data->request, task_data->len, response);
+    conn_state->w_buffer = response;
+    conn_state->w_length = len;
+
+    pthread_mutex_unlock(&conn_state->lock);
+    submit_result_to_io_thread(task_data->fd, task_data->state);
+
+#else
+    char* response = malloc(MAX_RESPONSE_SIZE);
+    if(response == NULL){
+        printf("malloc response failed.\n");
+        exit(1);
+    }
+    int res_len = protocol_handle(task_data->request, task_data->len, response); 
+    submit_result_to_io_thread(task_data->fd, response, res_len);
+#endif
 
     task_data_t *data = (task_data_t *)task->user_date;
     conn_dec_ref(&g_conn_list[data->fd]); // 此 worker 线程执行完这个任务，就减少对应 fd 的引用计数
@@ -474,33 +532,50 @@ int recv_callback(int clientfd, subreactor_state_t *state)
 
 int send_callback(int clientfd, subreactor_state_t *state)
 {
-    struct conn *conn_state = &g_conn_list[clientfd];
-    if (conn_state->w_buffer == NULL || conn_state->w_length == 0)
-    {
+    struct conn* conn_state = &g_conn_list[clientfd];
+    if (conn_state->w_buffer == NULL || conn_state->w_length == 0) {
+        // 发送完成，重置偏移，转为监听读事件
+        conn_state->send_offset = 0;
         set_event(clientfd, EPOLLIN, 0, state);
         return 0;
     }
 
-    int send_len = send(clientfd, g_conn_list[clientfd].w_buffer, g_conn_list[clientfd].w_length, 0);
-    if (send_len < 0)
-    {
-        perror("send");
-        if (conn_state->w_buffer != NULL)
-        {
+    // 尝试发送剩余数据
+    size_t to_send = conn_state->w_length - conn_state->send_offset;
+    int send_len = send(clientfd, conn_state->w_buffer + conn_state->send_offset, to_send, 0);
+    if (send_len > 0) {
+        conn_state->send_offset += send_len;
+        if (conn_state->send_offset >= conn_state->w_length) {
             free(conn_state->w_buffer);
+            conn_state->w_buffer = NULL;
+            conn_state->w_length = 0;
+            conn_state->send_offset = 0;
+            set_event(clientfd, EPOLLIN, 0, state);
+            return 0;
         }
+        // 部分发送，继续尝试，下次epoll触发
+        return 0;
+    } 
+    else if (send_len < 0) {
+        if (errno == EAGAIN || errno == EWOULDBLOCK) {
+            // 发送缓冲区满，保持EPOLLOUT，下次可写时重试
+            return 0;
+        } 
+        else {
+            // 如果不是发送缓冲区满导致的错误，就关闭这个连接
+            perror("send");
+            free(conn_state->w_buffer);
+            conn_state->w_buffer = NULL;
+            conn_dec_ref(conn_state);
+            return -1;
+        }
+    } 
+    else {
+        free(conn_state->w_buffer);
         conn_state->w_buffer = NULL;
         conn_dec_ref(conn_state);
         return -1;
     }
-
-    free(conn_state->w_buffer);
-    conn_state->w_buffer = NULL;
-    conn_state->w_length = 0;
-
-    set_event(clientfd, EPOLLIN, 0, state); // 写完关注可读事件
-
-    return 0;
 }
 
 // 传入 mainractor 创建的属于此 subreactor 的 eventfd 和 fd_queue
@@ -526,8 +601,7 @@ void *subreactor_callback(void *arg)
 
     // 用于 I/O 线程与 worker 线程的通信 -> worker 线程通知 I/O 线程自己处理完了
     int result_queue_eventfd = eventfd(0, EFD_NONBLOCK | EFD_CLOEXEC);
-    if (result_queue_eventfd < 0)
-    {
+    if (result_queue_eventfd < 0){
         perror("eventfd");
         exit(1);
     }
@@ -540,55 +614,36 @@ void *subreactor_callback(void *arg)
     result_queue_init(&sub_state->result_queue);
 
     struct epoll_event events[EPOLL_EVENT_SIZE] = {0};
-    while (1)
-    {
+    while (g_subreactor_running) {
         int nready = epoll_wait(epollfd, events, EPOLL_EVENT_SIZE, -1);
-        for (int i = 0; i < nready; ++i)
-        {
+        for (int i = 0; i < nready; ++i){
             int fd = events[i].data.fd;
 
-            if (fd == result_queue_eventfd)
-            {
+            if (fd == result_queue_eventfd){
                 uint64_t val;
                 eventfd_read(result_queue_eventfd, &val); // 读取以清空计数器
                 handle_pending_results(sub_state);
                 continue;
             }
 
-            if (fd == sub_state->fdqueue_eventfd)
-            {
+            if (fd == sub_state->fdqueue_eventfd){
                 uint64_t val;
                 eventfd_read(sub_state->fdqueue_eventfd, &val); // 读取以清空计数器
                 handle_pending_fds(index);
                 continue;
             }
 
-            if (events[i].events & EPOLLIN)
-            {
+            if (events[i].events & EPOLLIN){
                 g_conn_list[fd].recv_cb(fd, sub_state);
             }
-            if (events[i].events & EPOLLOUT)
-            {
+            if (events[i].events & EPOLLOUT){
                 g_conn_list[fd].send_cb(fd, sub_state);
             }
         }
     }
 
 end:
-    for (int fd = 0; fd < CONN_LIST_SIZE; ++fd)
-    {
-        struct conn *conn_state = &g_conn_list[fd];
-        if (conn_state->w_buffer != NULL)
-        {
-            free(conn_state->w_buffer);
-        }
-    }
 
-    if (sub_state->result_queue.results != NULL)
-    {
-        free(sub_state->result_queue.results);
-    }
-    return NULL;
 }
 
 // ==========================================================================================
@@ -663,7 +718,7 @@ void fd_queue_init(fd_queue_t *fd_queue)
 int accept_callback(int listenfd)
 {
     struct sockaddr_in client_addr = {0};
-    socklen_t len = 0;
+    socklen_t len = sizeof(client_addr);
     int clientfd = accept(listenfd, (struct sockaddr *)&client_addr, &len);
     if (clientfd == -1)
     {
@@ -723,15 +778,41 @@ int main(int argc, char *argv[])
     }
 
 end:
-    for (int i = 0; i < SUBREACTOR_THREAD_NUM; ++i)
-    {
-        if (subreactor_data_list[i].fd_queue.clientfds != NULL)
-        {
+#if XIUGAI
+    nThreadPoolDestroy(&g_worker_pool);
+
+    g_subreactor_running = 0;
+    for(int i = 0; i < SUBREACTOR_THREAD_NUM; ++i){
+        pthread_join(subreactor_data_list[i].threadid, NULL);
+        if (subreactor_data_list[i].fd_queue.clientfds != NULL){
             free(subreactor_data_list[i].fd_queue.clientfds);
+        }
+        pthread_mutex_destroy(&subreactor_data_list[i].fd_queue.lock); 
+
+        if(subreactor_state_list[i].result_queue.results != NULL){
+            free(subreactor_state_list[i].result_queue.results);
+        }
+        pthread_mutex_destroy(&subreactor_state_list[i].result_queue.lock);
+
+        close(subreactor_state_list[i].fdqueue_eventfd);
+        close(subreactor_state_list[i].resqueue_eventfd);
+        close(subreactor_state_list[i].epollfd);
+    }
+
+    for (int fd = 0; fd < CONN_LIST_SIZE; ++fd){
+        struct conn *conn_state = &g_conn_list[fd];
+        if (conn_state->w_buffer != NULL){
+            free(conn_state->w_buffer); 
+        }
+        if(conn_state->ref_count > 0){ // 说明此fd还没被关闭
+            close(conn_state->fd);
+            pthread_mutex_destroy(&conn_state->lock);
         }
     }
 
-    nThreadPoolDestroy(&g_worker_pool);
+    close(epollfd);
+    close(listenfd);
 }
+#endif
 
 #endif
