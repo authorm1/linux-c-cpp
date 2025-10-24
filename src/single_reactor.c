@@ -34,6 +34,8 @@
 
 #define ENABLE_SERVICE_SIMULATION       0 // 模拟业务处理逻辑 -> 0-10ms
 
+#define HTTP 1
+
 typedef int(*RCALLBACK)(int);
 
 #define XIUGAI 1
@@ -277,7 +279,30 @@ int protocol_handle(char* request, int req_len, char* response){
 
  
 #endif
+
+#if HTTP
+    if (strncmp(request, "GET ", 4) == 0) {
+        // 构造标准 HTTP 响应
+        const char *http_response =
+            "HTTP/1.1 200 OK\r\n"
+            "Content-Type: text/plain\r\n"
+            "Content-Length: 12\r\n"
+            "Connection: keep-alive\r\n"
+            "\r\n"
+            "Hello World\n";
+
+        // 复制到写缓冲区
+        memcpy(response, http_response, MAX_RESPONSE_SIZE);
+        return strlen(http_response);
+    } else {
+        // 不支持的请求
+        const char *bad = "HTTP/1.1 400 Bad Request\r\nConnection: close\r\n\r\n";
+        strncpy(response, bad, MAX_RESPONSE_SIZE);
+        return strlen(bad);
+    }
+#else
     memcpy(response, request, req_len);
+#endif
     return req_len;
 }
 
